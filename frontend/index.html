@@ -56,9 +56,11 @@ createApp({
     const user=ref(localStorage.getItem('slicegate_user')||'');
     const username=ref('admin'), password=ref('123456'), err=ref(''), tab=ref(0), actionErr=ref('');
     const slices=ref([]), releases=ref([]), watermarks=ref([]);
+    const daycloses=ref([]), bizdates=ref([]), deviations=ref([]), recon=ref(null);
+    const closeForm=ref({biz_date:'2026-11-02',standard:'乙闭法'}), closeErr=ref('');
     const form=ref({slice_no:'SL-2026-11-03-east',biz_date:'2026-11-03',partition_key:'east',row_count:1000,expected_count:1000});
     const releaseSliceId=ref(1), consumer=ref('ads_order');
-    const nav=['切片登记','完整度裁决','下游放行','消费水位'];
+    const nav=['切片登记','完整度裁决','下游放行','消费水位','关日台账'];
     const completeCnt=computed(()=>slices.value.filter(s=>s.completeness==='完整').length);
     const openCnt=computed(()=>slices.value.filter(s=>s.release_status!=='已放行').length);
     function auth(){return {Authorization:'Bearer '+token.value,'Content-Type':'application/json'};}
@@ -85,13 +87,21 @@ createApp({
       releases.value=Array.isArray(rel.items)?rel.items:[];
       const w=await loadJson('/api/watermarks'); if(w===null) return;
       watermarks.value=Array.isArray(w.items)?w.items:[];
+      const dc=await loadJson('/api/daycloses'); if(dc===null) return;
+      daycloses.value=Array.isArray(dc.items)?dc.items:[];
+      const bd=await loadJson('/api/bizdates'); if(bd===null) return;
+      bizdates.value=Array.isArray(bd.items)?bd.items:[];
+      const dv=await loadJson('/api/deviations'); if(dv===null) return;
+      deviations.value=Array.isArray(dv.items)?dv.items:[];
       if(slices.value.length) releaseSliceId.value=slices.value[0].id;
     }
     async function createSlice(){actionErr.value='';const r=await fetch('/api/slices',{method:'POST',headers:auth(),body:JSON.stringify(form.value)});const j=await r.json();if(!r.ok)actionErr.value=j.detail||'失败';await refresh();}
     async function evaluate(id){await fetch('/api/slices/'+id+'/evaluate',{method:'POST',headers:auth()});await refresh();}
     async function doRelease(){actionErr.value='';const r=await fetch('/api/slices/'+releaseSliceId.value+'/release',{method:'POST',headers:auth(),body:JSON.stringify({consumer:consumer.value})});const j=await r.json();if(!r.ok)actionErr.value=j.detail||'放行失败';await refresh();}
+    async function doClose(){closeErr.value='';recon.value=null;const r=await fetch('/api/bizdates/'+encodeURIComponent(closeForm.value.biz_date)+'/close',{method:'POST',headers:auth(),body:JSON.stringify({standard:closeForm.value.standard})});const j=await r.json();if(!r.ok){closeErr.value=j.detail||'关日失败';}await refresh();}
+    async function showRecon(d){const j=await loadJson('/api/bizdates/'+encodeURIComponent(d)+'/reconcile');if(j)recon.value=j;}
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,tab,nav,slices,releases,watermarks,form,releaseSliceId,consumer,actionErr,completeCnt,openCnt,login,logout,createSlice,evaluate,doRelease};
+    return {token,user,username,password,err,tab,nav,slices,releases,watermarks,form,releaseSliceId,consumer,actionErr,completeCnt,openCnt,login,logout,createSlice,evaluate,doRelease,daycloses,bizdates,deviations,recon,closeForm,closeErr,doClose,showRecon};
   },
   template:`
   <div v-if="!token" class="login">
@@ -149,14 +159,67 @@ createApp({
         </div>
         <div class="panel">
           <h2>放行流水</h2>
-          <table><thead><tr><th>切片</th><th>下游</th><th>结果</th><th>时间</th></tr></thead>
-          <tbody><tr v-for="r in releases" :key="r.id"><td class="mono">{{r.slice_no}}</td><td>{{r.consumer}}</td><td>{{r.status}}</td><td class="mono">{{r.created_at}}</td></tr></tbody></table>
+          <table><thead><tr><th>切片</th><th>下游</th><th>结果</th><th>旁注</th><th>时间</th></tr></thead>
+          <tbody><tr v-for="r in releases" :key="r.id"><td class="mono">{{r.slice_no}}</td><td>{{r.consumer}}</td><td><span class="tag" :class="{bad:r.status!=='成功'}">{{r.status}}</span></td><td>{{r.note}}</td><td class="mono">{{r.created_at}}</td></tr></tbody></table>
         </div>
       </div>
       <div v-show="tab===3" class="panel">
         <h2>消费水位</h2>
         <table><thead><tr><th>消费方</th><th>业务日</th><th>水位</th><th>来源切片</th></tr></thead>
         <tbody><tr v-for="w in watermarks" :key="w.id"><td>{{w.consumer}}</td><td>{{w.biz_date}}</td><td class="mono">{{w.watermark}}</td><td class="mono">{{w.source_slice}}</td></tr></tbody></table>
+      </div>
+      <div v-show="tab===4">
+        <div class="grid">
+          <div class="panel">
+            <h2>启动关日</h2>
+            <label>业务日</label><input v-model="closeForm.biz_date"/>
+            <label>关日口径（落入关日争用说明后当日不得更换）</label>
+            <select v-model="closeForm.standard">
+              <option value="甲闭法">甲闭法：启动后同一事务拒绝新成功放行并回滚未提交草稿</option>
+              <option value="乙闭法">乙闭法：在途持锁放行跑完再闩死，未拿锁草稿作废禁再提交</option>
+            </select>
+            <button class="primary" @click="doClose">关日</button>
+            <div class="err">{{closeErr}}</div>
+          </div>
+          <div class="panel">
+            <h2>业务日目录（目录旁注 / 策略旁注）</h2>
+            <table><thead><tr><th>业务日</th><th>状态</th><th>口径</th><th>旁注</th><th></th></tr></thead>
+            <tbody><tr v-for="b in bizdates" :key="b.biz_date">
+              <td class="mono">{{b.biz_date}}</td>
+              <td><span class="tag" :class="{bad:b.state!=='开放'}">{{b.state}}</span></td>
+              <td>{{b.standard||'—'}}</td><td>{{b.note}}</td>
+              <td><button class="ghost" @click="showRecon(b.biz_date)">对账</button></td>
+            </tr></tbody></table>
+          </div>
+        </div>
+        <div class="grid" style="margin-top:14px">
+          <div class="panel">
+            <h2>关日台账</h2>
+            <table><thead><tr><th>业务日</th><th>口径</th><th>状态</th><th>成功数</th><th>作废数</th><th>启动</th><th>闩死</th></tr></thead>
+            <tbody><tr v-for="d in daycloses" :key="d.id">
+              <td class="mono">{{d.biz_date}}</td><td>{{d.standard}}</td>
+              <td><span class="tag" :class="{bad:d.status!=='已闩死'}">{{d.status}}</span></td>
+              <td class="mono">{{d.success_count}}</td><td class="mono">{{d.voided_count}}</td>
+              <td class="mono">{{d.started_at}}</td><td class="mono">{{d.latched_at||'—'}}</td>
+            </tr></tbody></table>
+          </div>
+          <div class="panel">
+            <h2>口径偏离登记（关日口径偏了）</h2>
+            <table><thead><tr><th>业务日</th><th>已钉口径</th><th>被拒口径</th><th>说明</th><th>时间</th></tr></thead>
+            <tbody><tr v-for="v in deviations" :key="v.id">
+              <td class="mono">{{v.biz_date}}</td><td>{{v.pinned_standard}}</td><td>{{v.requested_standard}}</td>
+              <td>{{v.detail}}</td><td class="mono">{{v.created_at}}</td>
+            </tr></tbody></table>
+          </div>
+        </div>
+        <div class="panel" v-if="recon" style="margin-top:14px">
+          <h2>对账：{{recon.biz_date}} — <span class="tag" :class="{bad:!recon.consistent}">{{recon.consistent?'五账一致':'不一致'}}</span></h2>
+          <table><thead><tr><th>勾稽项</th><th>结论</th><th>明细</th></tr></thead>
+          <tbody><tr v-for="ch in recon.checks" :key="ch.name">
+            <td>{{ch.name}}</td><td><span class="tag" :class="{bad:!ch.ok}">{{ch.ok?'平':'差'}}</span></td><td>{{ch.detail}}</td>
+          </tr></tbody></table>
+          <p style="color:var(--muted);font-size:13px">成功流水 {{recon.success_flow.count}} 笔 · 关日争用拒绝 {{recon.contended_count}} 笔 · 切片 {{recon.slices.total}} 张 · 水位 {{recon.watermark_count}} 笔 · 口径偏离 {{recon.deviations.length}} 笔</p>
+        </div>
       </div>
     </main>
   </div>`
